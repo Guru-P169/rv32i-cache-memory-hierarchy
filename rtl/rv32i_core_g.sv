@@ -8,17 +8,30 @@ module rv32i_core_g (
     logic [31:0] next_pc;
     logic [31:0] pc_plus4;
     logic pc_write;
+    logic [31:0] instruction;
+    logic fetch_pending;
+    logic fetch_buffer_valid;
+    logic discard_fetch;
+    logic [31:0] fetch_buffer_instruction;
+    logic fetch_saved_predicted_taken;
+    logic [31:0] fetch_saved_predicted_target;
+    logic [3:0] fetch_saved_gshare_index;
+    logic [31:0] fetch_saved_next_pc;
+    logic [31:0] fetch_saved_pc;
+    logic [31:0] fetch_saved_pc_plus4;
+    logic id_instruction_valid;
+    logic fetch_accept;
+    logic dcache_request_active;
+    logic dcache_stall;
+    logic pipeline_stall;
+    logic [2:0] id_mem_funct3;
+    logic [2:0] ex_mem_funct3;
+    logic [2:0] mem_funct3;
+    logic [31:0] dcache_aligned_wdata;
 
     assign pc_plus4 = pc + 32'd4;
 
 
-   
-    logic [31:0] instruction;
-
-    rv32i_instruction_memory_g imem (
-        .address (pc),
-        .instruction(instruction)
-    );
 
 
     // IF / ID  register
@@ -226,6 +239,20 @@ logic [31:0] wb_writeback_data;
     
     logic [31:0] mem_read_data;
 
+    logic hierarchy_i_req;
+    logic [31:0] hierarchy_i_addr;
+    logic [31:0] hierarchy_i_instr;
+    logic hierarchy_i_ready;
+
+    logic hierarchy_d_req;
+    logic hierarchy_d_write;
+    logic [31:0] hierarchy_d_addr;
+    logic [31:0] hierarchy_d_wdata;
+    logic [3:0] hierarchy_d_byte_en;
+    logic [2:0] hierarchy_d_load_type;
+    logic [31:0] hierarchy_d_rdata;
+    logic hierarchy_d_ready;
+
 
     // MEM / WB   register
  
@@ -241,7 +268,10 @@ logic [31:0] wb_writeback_data;
     logic wb_jal;
     logic wb_jalr;
 
-
+logic icache_req;
+logic [31:0] icache_addr;
+logic [31:0] icache_instr;
+logic icache_ready;
     
 
     // PC
@@ -280,7 +310,8 @@ logic [31:0] wb_writeback_data;
 
         .alu_control (id_alu_control),
         .uses_rs1 (id_uses_rs1),
-        .uses_rs2 (id_uses_rs2)
+        .uses_rs2 (id_uses_rs2),
+        .mem_funct3 (id_mem_funct3)
     );
 
 
@@ -334,17 +365,17 @@ end
         .flush (flush_if_id),
         .if_id_write (if_id_write),
 
-        .if_pc (pc),
-        .if_pc_plus4 (pc_plus4),
-        .if_instruction(instruction),
+        .if_pc (fetch_saved_pc),
+        .if_pc_plus4 (fetch_saved_pc_plus4),
+        .if_instruction(fetch_buffer_instruction),
 
         .id_pc (id_pc),
         .id_pc_plus4 (id_pc_plus4),
         .id_instruction(id_instruction),
-        .if_predicted_taken(if_predicted_taken),
-        .if_predicted_target(if_predicted_target),
+        .if_predicted_taken(fetch_saved_predicted_taken),
+        .if_predicted_target(fetch_saved_predicted_target),
 
-        .if_gshare_predict_index(gshare_predict_index),
+        .if_gshare_predict_index(fetch_saved_gshare_index),
         .id_gshare_predict_index(id_gshare_predict_index),
 
         .id_predicted_taken(id_predicted_taken),
@@ -359,7 +390,8 @@ end
         .reset (reset),
 
         .flush (flush_id_ex),
-        .insert_bubble(insert_bubble),
+        .insert_bubble(insert_bubble || !id_instruction_valid),
+        .stall (pipeline_stall),
 
         .id_pc (id_pc),
         .id_pc_plus4 (id_pc_plus4),
@@ -377,6 +409,7 @@ end
         .id_memread (id_memread),
         .id_memwrite (id_memwrite),
         .id_memtoreg (id_memtoreg),
+        .id_mem_funct3 (id_mem_funct3),
         .id_alusrc (id_alusrc),
 
         .id_branch (id_branch),
@@ -411,6 +444,7 @@ end
         .ex_memread (ex_memread),
         .ex_memwrite (ex_memwrite),
         .ex_memtoreg (ex_memtoreg),
+        .ex_mem_funct3 (ex_mem_funct3),
         .ex_alusrc (ex_alusrc),
 
         .ex_branch (ex_branch),
@@ -625,12 +659,12 @@ end
 
     assign btb_update_is_branch = ex_branch;
 
-    assign btb_update_valid = ex_branch || ex_jal || ex_jalr;
+    assign btb_update_valid = (ex_branch || ex_jal || ex_jalr) && !dcache_stall;
 
 
     // PC NEXT LOGIC
 
-    assign predictor_update_valid = ex_branch;
+    assign predictor_update_valid = ex_branch && !dcache_stall;
 
     assign predictor_update_taken =branch_taken;
 
@@ -685,7 +719,7 @@ end
         next_pc = redirect_pc;
 
     else
-        next_pc = predicted_next_pc;
+        next_pc = fetch_saved_next_pc;
 
     end
 
@@ -696,20 +730,18 @@ assign if_predicted_target = btb_predict_target;
     // CONTROL TRANSFER
 
 
-    always_comb begin
-
+   always_comb begin
     branch_misprediction = 1'b0;
 
-    if (actual_taken != ex_predicted_taken)
-        branch_misprediction = 1'b1;
-
-    else if (actual_taken &&
-             ex_predicted_taken &&
-             actual_target != ex_predicted_target)
-        branch_misprediction = 1'b1;
-
+    if (!dcache_stall && (ex_branch || ex_jal || ex_jalr)) begin
+        if (actual_taken != ex_predicted_taken)
+            branch_misprediction = 1'b1;
+        else if (actual_taken &&
+                 ex_predicted_taken &&
+                 (actual_target != ex_predicted_target))
+            branch_misprediction = 1'b1;
     end
-
+end
     // FLUSH LOGIC
   
     assign flush_if_id = branch_misprediction;
@@ -723,34 +755,26 @@ assign if_predicted_target = btb_predict_target;
         .ifid_rs1 (id_rs1),
         .ifid_rs2 (id_rs2),
 
-        .ifid_uses_rs1(id_uses_rs1),
-        .ifid_uses_rs2(id_uses_rs2),
+        .ifid_uses_rs1(id_instruction_valid && id_uses_rs1),
+        .ifid_uses_rs2(id_instruction_valid && id_uses_rs2),
 
         .pc_write (hazard_pc_write),
         .if_id_write (hazard_if_id_write),
         .insert_bubble(insert_bubble)
     );
 
-    // STALL / FLUSH PRIORITY
-    
-    always_comb begin
-
+     // STALL / FLUSH PRIORITY
+    assign fetch_accept = fetch_buffer_valid && !dcache_stall && hazard_if_id_write && !branch_misprediction;
+always_comb begin
     if (branch_misprediction) begin
-
         pc_write = 1'b1;
         if_id_write = 1'b1;
-
     end
-
     else begin
-
-        pc_write = hazard_pc_write;
-        if_id_write = hazard_if_id_write;
-
+        pc_write = fetch_accept && hazard_pc_write;
+        if_id_write = fetch_accept && hazard_if_id_write;
     end
-
 end
-
     // STORE DATA
    
     logic [31:0] ex_store_data;
@@ -764,6 +788,7 @@ end
         .clk (clk),
         .reset (reset),
         .flush (1'b0),
+        .stall (dcache_stall),
 
         .ex_alu_result(alu_result),
         .ex_store_data(ex_store_data),
@@ -775,6 +800,7 @@ end
         .ex_memread (ex_memread),
         .ex_memwrite (ex_memwrite),
         .ex_memtoreg (ex_memtoreg),
+        .ex_mem_funct3 (ex_mem_funct3),
 
         .ex_jal (ex_jal),
         .ex_jalr (ex_jalr),
@@ -789,27 +815,160 @@ end
         .mem_memread (mem_memread),
         .mem_memwrite (mem_memwrite),
         .mem_memtoreg (mem_memtoreg),
+        .mem_funct3 (mem_funct3),
 
         .mem_jal (mem_jal),
         .mem_jalr (mem_jalr)
     );
 
 
-    // data memory
-   
-    rv32i_data_memory_g dmem (
+    assign dcache_req = (mem_memread || mem_memwrite) && !dcache_request_active;
+    assign dcache_addr = mem_alu_result;
+    assign dcache_write = mem_memwrite;
+    assign dcache_load_type = mem_funct3;
+    assign mem_read_data = dcache_rdata;
+    assign dcache_stall = (mem_memread || mem_memwrite) && !dcache_ready;
+    assign pipeline_stall = dcache_stall;
+
+    always_comb begin
+        dcache_byte_en = 4'b0000;
+        dcache_aligned_wdata = mem_store_data;
+
+        if (mem_memwrite) begin
+            case (mem_funct3)
+                3'b000: begin
+                    dcache_byte_en = 4'b0001 << mem_alu_result[1:0];
+                    dcache_aligned_wdata = mem_store_data << (8 * mem_alu_result[1:0]);
+                end
+                3'b001: begin
+                    if (mem_alu_result[1] == 1'b0) begin
+                        dcache_byte_en = 4'b0011;
+                        dcache_aligned_wdata = mem_store_data;
+                    end
+                    else begin
+                        dcache_byte_en = 4'b1100;
+                        dcache_aligned_wdata = mem_store_data << 16;
+                    end
+                end
+                3'b010: begin
+                    dcache_byte_en = 4'b1111;
+                    dcache_aligned_wdata = mem_store_data;
+                end
+                default: begin
+                    dcache_byte_en = 4'b0000;
+                    dcache_aligned_wdata = mem_store_data;
+                end
+            endcase
+        end
+    end
+
+    assign dcache_wdata = dcache_aligned_wdata;
+
+    always_ff @(posedge clk) begin
+        if (reset)
+            dcache_request_active <= 1'b0;
+        else begin
+            if (dcache_req)
+                dcache_request_active <= 1'b1;
+            if (dcache_ready)
+                dcache_request_active <= 1'b0;
+        end
+    end
+
+    rv32i_cache_hierarchy_g #(
+        .MEMORY_BYTES (65536),
+        .MEMORY_LATENCY (5),
+        .INIT_FILE ("instruction_memory.hex")
+    ) cache_hierarchy (
         .clk (clk),
         .reset (reset),
-
-        .address (mem_alu_result),
-        .write_data(mem_store_data),
-
-        .memread (mem_memread),
-        .memwrite (mem_memwrite),
-
-        .read_data (mem_read_data)
+        .i_req (hierarchy_i_req),
+        .i_addr (hierarchy_i_addr),
+        .i_instr (hierarchy_i_instr),
+        .i_ready (hierarchy_i_ready),
+        .d_req (hierarchy_d_req),
+        .d_write (hierarchy_d_write),
+        .d_addr (hierarchy_d_addr),
+        .d_wdata (hierarchy_d_wdata),
+        .d_byte_en (hierarchy_d_byte_en),
+        .d_load_type (hierarchy_d_load_type),
+        .d_rdata (hierarchy_d_rdata),
+        .d_ready (hierarchy_d_ready)
     );
 
+    assign hierarchy_i_req = !fetch_pending && !fetch_buffer_valid && !dcache_stall && !branch_misprediction;
+    assign hierarchy_i_addr = pc;
+    assign hierarchy_d_req = dcache_req;
+    assign hierarchy_d_write = dcache_write;
+    assign hierarchy_d_addr = dcache_addr;
+    assign hierarchy_d_wdata = dcache_wdata;
+    assign hierarchy_d_byte_en = dcache_byte_en;
+    assign hierarchy_d_load_type = dcache_load_type;
+    assign dcache_rdata = hierarchy_d_rdata;
+    assign dcache_ready = hierarchy_d_ready;
+    assign icache_instr = hierarchy_i_instr;
+    assign icache_ready = hierarchy_i_ready;
+    assign icache_req = hierarchy_i_req;
+    assign icache_addr = hierarchy_i_addr;
+    assign instruction = icache_instr;
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            fetch_pending <= 1'b0;
+            fetch_buffer_valid <= 1'b0;
+            discard_fetch <= 1'b0;
+            fetch_buffer_instruction <= 32'h00000013;
+            fetch_saved_predicted_taken <= 1'b0;
+            fetch_saved_predicted_target <= 32'b0;
+            fetch_saved_gshare_index <= 4'b0;
+            fetch_saved_next_pc <= 32'd4;
+            fetch_saved_pc <= 32'b0;
+            fetch_saved_pc_plus4 <= 32'd4;
+            id_instruction_valid <= 1'b0;
+        end
+        else begin
+            if (hierarchy_i_req) begin
+                fetch_pending <= 1'b1;
+                fetch_saved_predicted_taken <= if_predicted_taken;
+                fetch_saved_predicted_target <= if_predicted_target;
+                fetch_saved_gshare_index <= gshare_predict_index;
+                fetch_saved_next_pc <= predicted_next_pc;
+                fetch_saved_pc <= pc;
+                fetch_saved_pc_plus4 <= pc_plus4;
+            end
+
+            if (branch_misprediction) begin
+                if (fetch_pending)
+                    discard_fetch <= 1'b1;
+                if (fetch_buffer_valid)
+                    fetch_buffer_valid <= 1'b0;
+            end
+
+            if (fetch_pending && hierarchy_i_ready) begin
+                fetch_pending <= 1'b0;
+                if (discard_fetch || branch_misprediction) begin
+                    discard_fetch <= 1'b0;
+                end
+                else begin
+                    fetch_buffer_instruction <= hierarchy_i_instr;
+                    fetch_buffer_valid <= 1'b1;
+                end
+            end
+
+            if (branch_misprediction) begin
+                id_instruction_valid <= 1'b0;
+            end
+            else if (fetch_accept) begin
+                id_instruction_valid <= 1'b1;
+            end
+            else if (id_instruction_valid && !dcache_stall && !insert_bubble) begin
+                id_instruction_valid <= 1'b0;
+            end
+
+            if (fetch_accept)
+                fetch_buffer_valid <= 1'b0;
+        end
+    end
 
     // MEM / WB
    
@@ -817,6 +976,7 @@ end
         .clk (clk),
         .reset (reset),
         .flush (1'b0),
+        .stall (dcache_stall),
 
         .mem_alu_result(mem_alu_result),
         .mem_read_data (mem_read_data),
