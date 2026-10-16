@@ -30,7 +30,7 @@ module rv32i_memory_hierarchy_g #(
         .NUM_WAYS(4)
     ) u_l2_cache (
         .clk(clk),
-        .reset(reset),
+        .rst(reset),
 
         .req(req),
         .write(write),
